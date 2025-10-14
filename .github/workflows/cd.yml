@@ -1,0 +1,86 @@
+name: CD - Train, Experiment, and Deploy Best Model
+
+on:
+  push:
+    branches:
+      - deployment-test
+
+jobs:
+  train-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-southeast-2 # Change to your S3 bucket's region
+
+      # --- THIS STEP IS UPDATED ---
+      - name: Set up Python, DVC, and jq
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.13'
+      - run: |
+          pip install -r requirements.txt
+          # Explicitly upgrade DVC to a modern version that supports --no-header
+          sudo apt-get update && sudo apt-get install -y jq bc
+      # ---------------------------
+
+      - name: Configure Git
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+
+      - name: Pull DVC Cache
+        run: dvc pull
+
+      - name: Run DVC Experiments from Script
+        run: |
+          chmod +x run_experiments.sh
+          ./run_experiments.sh
+
+      - name: Find and Apply Best Experiment
+        id: find_best
+        run: |
+          BEST_EXP=$(cat best_experiment.txt)
+          echo "Best experiment found: $BEST_EXP"
+          dvc experiments apply $BEST_EXP
+          echo "best_exp_name=$BEST_EXP" >> $GITHUB_OUTPUT
+
+      - name: Push Best Model to DVC Remote
+        run: dvc push
+
+      - name: Promote Best Model to Production S3 Path
+        run: |
+          echo "Promoting model from experiment ${{ steps.find_best.outputs.best_exp_name }} to production..."
+          aws s3 cp models/model.pkl s3://india-crop-yield-dvc-storage/production/model.pkl
+          aws s3 cp models/model_columns.json s3://india-crop-yield-dvc-storage/production/model_columns.json
+
+      - name: Commit Experiment Results
+        run: |
+          git add .
+          git commit -m "chore: Run experiments and apply best model (${{ steps.find_best.outputs.best_exp_name }})"
+          git push
+
+  deploy-to-ec2:
+    runs-on: ubuntu-latest
+    needs: train-and-deploy
+    if: success()
+    steps:
+      - name: Deploy to EC2 instance
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            cd sustainable_ag_mlops
+            git pull
+            docker compose up --build -d

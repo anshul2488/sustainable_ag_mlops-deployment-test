@@ -1,0 +1,8 @@
+pandas
+scikit-learn
+dvc[s3]
+boto3
+fastapi
+uvicorn[standard]
+python-multipart
+PyYAML
